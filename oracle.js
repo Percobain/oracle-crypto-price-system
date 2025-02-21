@@ -64,9 +64,7 @@ async function setupClient() {
 }
 
 async function updatePrice(client, sender, tokenId, price) {
-    // Convert price to proper format with 18 decimal places
-    const formattedPrice = BigInt(Math.round(parseFloat(price) * 10**18)).toString();
-
+    // Use the price string directly without any formatting since it's already in the correct format
     const msg = {
         typeUrl: "/cosmwasm.wasm.v1.MsgExecuteContract",
         value: {
@@ -75,7 +73,7 @@ async function updatePrice(client, sender, tokenId, price) {
             msg: Buffer.from(JSON.stringify({
                 set_price: {
                     token_id: parseInt(tokenId),
-                    price_usd: formattedPrice
+                    price_usd: price // Use the price directly from nibid
                 }
             })).toString('base64'),
             funds: []
@@ -83,7 +81,8 @@ async function updatePrice(client, sender, tokenId, price) {
     };
   
     try {
-        console.log(`[${new Date().toISOString()}] Updating price for token ${tokenId} to ${price} USD...`);
+        console.log(`[${new Date().toISOString()}] Updating price for token ${tokenId}`);
+        console.log(`Price: ${price} USD`);
         console.log('Message:', JSON.stringify(msg, null, 2));
         
         const result = await client.signAndBroadcast(
