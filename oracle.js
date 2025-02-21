@@ -1,7 +1,11 @@
-const { DirectSecp256k1HdWallet } = require('@nibiruchain/nibijs');
-const { SigningCosmWasmClient } = require('@cosmjs/cosmwasm-stargate');
-const { stringToPath } = require("@cosmjs/crypto")
+const { DirectSecp256k1HdWallet, NibiruTxClient } = require('@nibiruchain/nibijs');
+const { stringToPath } = require("@cosmjs/crypto");
+const { Registry } = require('@cosmjs/proto-signing');
+const { defaultRegistryTypes } = require('@cosmjs/stargate');
+const { wasmTypes } = require('@cosmjs/cosmwasm-stargate');
 require('dotenv').config();
+const bip39 = require('bip39');
+const { execSync } = require('child_process');
 
 const {
     NIBIRU_MNEMONIC,
@@ -24,14 +28,31 @@ async function setupClient() {
             prefix: "nibi",
             hdPaths: [stringToPath("m/44'/118'/0'/0/0")]
         });
+        console.log("Wallet created successfully");
 
-        const [firstAccount] = await wallet.getAccounts();
+        const accounts = await wallet.getAccounts();
+        if (accounts.length === 0) {
+            throw new Error("No accounts found in the wallet.");
+        }
+
+        const firstAccount = accounts[0];
         console.log(`Connected with address: ${firstAccount.address}`);
+        console.log(`Account type: ${firstAccount.type || "Not defined"}`);
 
-        const client = await SigningCosmWasmClient.connectWithSigner(
+        // Create registry with CosmWasm support
+        const registry = new Registry([
+            ...defaultRegistryTypes,
+            ...wasmTypes
+        ]);
+
+        const client = await NibiruTxClient.connectWithSigner(
             NIBIRU_RPC,
             wallet,
-            { prefix: "nibi" }
+            { 
+                prefix: "nibi",
+                gasPrice: TX_CONFIG.gasPrices,
+                registry // Add the registry here
+            }
         );
         console.log("Client connected successfully");
       
@@ -43,29 +64,39 @@ async function setupClient() {
 }
 
 async function updatePrice(client, sender, tokenId, price) {
+    // Convert price to proper format with 18 decimal places
+    const formattedPrice = BigInt(Math.round(parseFloat(price) * 10**18)).toString();
+
     const msg = {
-        set_price: {
-            token_id: tokenId,
-            price_usd: price
+        typeUrl: "/cosmwasm.wasm.v1.MsgExecuteContract",
+        value: {
+            sender: sender,
+            contract: ORACLE_CONTRACT_ADDRESS,
+            msg: Buffer.from(JSON.stringify({
+                set_price: {
+                    token_id: parseInt(tokenId),
+                    price_usd: formattedPrice
+                }
+            })).toString('base64'),
+            funds: []
         }
     };
   
     try {
         console.log(`[${new Date().toISOString()}] Updating price for token ${tokenId} to ${price} USD...`);
-        const result = await client.execute(
+        console.log('Message:', JSON.stringify(msg, null, 2));
+        
+        const result = await client.signAndBroadcast(
             sender,
-            ORACLE_CONTRACT_ADDRESS,
-            msg,
+            [msg],
             {
                 amount: [{ denom: "unibi", amount: "750000" }],
-                gas: "auto",
-            },
-            "Update token price"
+                gas: "1000000",
+            }
         );
       
         console.log(`Price update successful`);
         console.log(`Transaction Hash: ${result.transactionHash}`);
-        // Add detailed transaction info
         console.log(`Transaction Details:`);
         console.log(`- Gas Used: ${result.gasUsed}`);
         console.log(`- Gas Wanted: ${result.gasWanted}`);
@@ -77,9 +108,46 @@ async function updatePrice(client, sender, tokenId, price) {
     }
 }
 
-async function fetchLatestPrice(tokenId) {
-    // For now hardcoded will add the proper API call later
-    return "4500";
+async function fetchAllTokenPairs() {
+    try {
+        // Use the full path to nibid binary in WSL
+        const cmd = 'wsl /root/go/bin/nibid q oracle exchange-rates -o json';
+        const result = execSync(cmd).toString();
+        const data = JSON.parse(result);
+        
+        // Create a mapping of pairs to token IDs
+        const tokenPairs = {};
+        data.exchange_rates.forEach(rate => {
+            // Extract base token from pair (e.g., "ubtc" from "ubtc:uusd")
+            const baseToken = rate.pair.split(':')[0];
+            // Map common tokens to their IDs based on your contract
+            switch(baseToken) {
+                case 'ubtc':
+                    tokenPairs[1] = rate.exchange_rate;
+                    break;
+                case 'ueth':
+                    tokenPairs[2] = rate.exchange_rate;
+                    break;
+                case 'uatom':
+                    tokenPairs[3] = rate.exchange_rate;
+                    break;
+                case 'uusdc':
+                    tokenPairs[4] = rate.exchange_rate;
+                    break;
+                case 'uusdt':
+                    tokenPairs[5] = rate.exchange_rate;
+                    break;
+            }
+        });
+        
+        return tokenPairs;
+    } catch (error) {
+        console.error("Error fetching exchange rates:", error);
+        // Add more detailed error information
+        console.error("Command output:", error.stdout?.toString());
+        console.error("Command stderr:", error.stderr?.toString());
+        throw error;
+    }
 }
 
 async function startPriceFeed() {
@@ -88,25 +156,30 @@ async function startPriceFeed() {
     
     try {
         const { client, address } = await setupClient();
-  
-        // Immediate first update
-        const tokenIds = [1]; // Real estate token ID
-        for (const tokenId of tokenIds) {
-            const latestPrice = await fetchLatestPrice(tokenId);
-            await updatePrice(client, address, tokenId, latestPrice);
-        }
 
-        // Schedule recurring updates
-        setInterval(async () => {
+        // Function to update all prices
+        const updateAllPrices = async () => {
             try {
-                for (const tokenId of tokenIds) {
-                    const latestPrice = await fetchLatestPrice(tokenId);
-                    await updatePrice(client, address, tokenId, latestPrice);
+                const tokenPrices = await fetchAllTokenPairs();
+                
+                for (const [tokenId, price] of Object.entries(tokenPrices)) {
+                    try {
+                        await updatePrice(client, address, parseInt(tokenId), price);
+                        console.log(`Updated price for token ${tokenId}: ${price} USD`);
+                    } catch (error) {
+                        console.error(`Failed to update price for token ${tokenId}:`, error);
+                    }
                 }
             } catch (error) {
-                console.error("Price feed iteration error:", error);
+                console.error("Failed to update prices:", error);
             }
-        }, parseInt(UPDATE_INTERVAL));
+        };
+
+        // Initial update
+        await updateAllPrices();
+
+        // Schedule recurring updates
+        setInterval(updateAllPrices, parseInt(UPDATE_INTERVAL));
   
         console.log("Price feed service started successfully");
     } catch (error) {
@@ -117,6 +190,11 @@ async function startPriceFeed() {
 
 // Start the price feed
 if (require.main === module) {
+    const mnemonic = process.env.NIBIRU_MNEMONIC; // Ensure this is set correctly
+    const isValid = bip39.validateMnemonic(mnemonic);
+
+    console.log(`Is the mnemonic valid? ${isValid}`);
+
     startPriceFeed().catch((error) => {
         console.error("Fatal error:", error);
         process.exit(1);
